@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """
-Extract selected events from agent JSONL logs.
+Extract selected events from OpenClaw session JSONL logs.
 
 Modes:
 - exec:     toolCall name == "exec"         -> arguments.command
@@ -18,9 +18,9 @@ Notes:
 - for file events, event_type is the specific action: read/write/edit
 - thinking output is kept to one line by default (newlines escaped). Use --keep-newlines to preserve.
 - --last N prints only the last N matched output records.
-- If no input file paths are provided, autodetects the latest session file from:
+- If no input file paths are provided, autodetects the session file from:
     ~/.openclaw/agents/main/sessions/sessions.json
-  by reading key "agent:main:main" and its "sessionFile".
+  using key "agent:main:main.sessionFile".
 """
 
 from __future__ import annotations
@@ -50,6 +50,8 @@ LABEL_COLORS = {
     "write": "\033[91m",     # bright red
     "edit": "\033[93m",      # bright yellow
 }
+
+VALID_MODES = {"exec", "thinking", "web", "fetch", "file", "all"}
 
 
 def _c(text: str, color: str) -> str:
@@ -103,10 +105,6 @@ def _message_content(obj: Dict[str, Any]) -> Optional[list]:
 
 
 def _autodetect_session_file() -> str:
-    """
-    Reads ~/.openclaw/agents/main/sessions/sessions.json, finds key "agent:main:main",
-    returns its "sessionFile".
-    """
     sessions_path = os.path.expanduser("~/.openclaw/agents/main/sessions/sessions.json")
     try:
         with open(sessions_path, "r", encoding="utf-8") as f:
@@ -131,12 +129,10 @@ def _extract_execs(obj: Dict[str, Any]) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
     if obj.get("type") != "message":
         return out
-
     ts = _get_timestamp(obj)
     content = _message_content(obj)
     if content is None:
         return out
-
     for item in content:
         if not isinstance(item, dict):
             continue
@@ -144,11 +140,9 @@ def _extract_execs(obj: Dict[str, Any]) -> List[Tuple[str, str]]:
             continue
         if item.get("name") != "exec":
             continue
-
         cmd = _safe_get(item, "arguments", "command")
         if isinstance(cmd, str) and cmd.strip():
             out.append((ts, cmd.strip()))
-
     return out
 
 
@@ -156,22 +150,18 @@ def _extract_thinking(obj: Dict[str, Any]) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
     if obj.get("type") != "message":
         return out
-
     ts = _get_timestamp(obj)
     content = _message_content(obj)
     if content is None:
         return out
-
     for item in content:
         if not isinstance(item, dict):
             continue
         if item.get("type") != "thinking":
             continue
-
         thinking = item.get("thinking")
         if isinstance(thinking, str) and thinking.strip():
             out.append((ts, thinking.strip()))
-
     return out
 
 
@@ -179,12 +169,10 @@ def _extract_web_searches(obj: Dict[str, Any]) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
     if obj.get("type") != "message":
         return out
-
     ts = _get_timestamp(obj)
     content = _message_content(obj)
     if content is None:
         return out
-
     for item in content:
         if not isinstance(item, dict):
             continue
@@ -192,11 +180,9 @@ def _extract_web_searches(obj: Dict[str, Any]) -> List[Tuple[str, str]]:
             continue
         if item.get("name") != "web_search":
             continue
-
         query = _safe_get(item, "arguments", "query")
         if isinstance(query, str) and query.strip():
             out.append((ts, query.strip()))
-
     return out
 
 
@@ -204,12 +190,10 @@ def _extract_web_fetches(obj: Dict[str, Any]) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
     if obj.get("type") != "message":
         return out
-
     ts = _get_timestamp(obj)
     content = _message_content(obj)
     if content is None:
         return out
-
     for item in content:
         if not isinstance(item, dict):
             continue
@@ -217,38 +201,28 @@ def _extract_web_fetches(obj: Dict[str, Any]) -> List[Tuple[str, str]]:
             continue
         if item.get("name") != "web_fetch":
             continue
-
         url = _safe_get(item, "arguments", "url")
         if isinstance(url, str) and url.strip():
             out.append((ts, url.strip()))
-
     return out
 
 
 def _extract_file_events(obj: Dict[str, Any]) -> List[Tuple[str, str, str]]:
-    """
-    Returns list of (timestamp, action, path) where action in {"read","write","edit"}.
-    We only print filenames/paths, not content.
-    """
     out: List[Tuple[str, str, str]] = []
     if obj.get("type") != "message":
         return out
-
     ts = _get_timestamp(obj)
     content = _message_content(obj)
     if content is None:
         return out
-
     for item in content:
         if not isinstance(item, dict):
             continue
         if item.get("type") != "toolCall":
             continue
-
         action = item.get("name")
         if action not in {"read", "write", "edit"}:
             continue
-
         args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
         path = (
             args.get("path")
@@ -257,23 +231,68 @@ def _extract_file_events(obj: Dict[str, Any]) -> List[Tuple[str, str, str]]:
             or args.get("filename")
             or args.get("target")
         )
-
-        if isinstance(path, str) and path.strip():
-            out.append((ts, action, path.strip()))
-        else:
-            out.append((ts, action, "UNKNOWN_PATH"))
-
+        out.append((ts, action, path.strip() if isinstance(path, str) and path.strip() else "UNKNOWN_PATH"))
     return out
 
 
+def _split_modes_and_rest(argv: List[str]) -> Tuple[Set[str], List[str]]:
+    """
+    Allow:
+      script.py exec /path/to/file.jsonl
+      script.py exec thinking --last 20
+    by consuming leading mode tokens until first non-mode token or '--'.
+    Everything after is passed to argparse (paths + flags).
+    """
+    modes: List[str] = []
+    rest: List[str] = []
+
+    it = iter(range(len(argv)))
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            rest = argv[i + 1 :]
+            break
+        if tok.startswith("-"):
+            # flags begin -> stop consuming modes
+            rest = argv[i:]
+            break
+        if tok in VALID_MODES:
+            modes.append(tok)
+            i += 1
+            continue
+        # first non-mode token -> it's a path (or something else), stop
+        rest = argv[i:]
+        break
+    else:
+        rest = []
+
+    return set(modes), rest
+
+
 def main() -> int:
+    modes, rest_argv = _split_modes_and_rest(sys.argv[1:])
+
+    if not modes:
+        print(f"[error] You must specify at least one mode: {', '.join(sorted(VALID_MODES))}", file=sys.stderr)
+        return 2
+
+    # Expand "all"
+    if "all" in modes:
+        modes.update({"exec", "thinking", "web", "fetch", "file"})
+        modes.discard("all")
+
+    unknown = sorted(modes - (VALID_MODES - {"all"}))
+    if unknown:
+        print(
+            f"[error] Unknown mode(s): {', '.join(unknown)}. "
+            f"Valid: exec, thinking, web, fetch, file, all",
+            file=sys.stderr,
+        )
+        return 2
+
     ap = argparse.ArgumentParser(
-        description="Extract exec/thinking/web/fetch/file events from JSONL logs."
-    )
-    ap.add_argument(
-        "modes",
-        nargs="+",
-        help="One or more modes: exec, thinking, web, fetch, file, all",
+        description="Extract exec/thinking/web/fetch/file events from OpenClaw JSONL logs."
     )
     ap.add_argument(
         "paths",
@@ -304,29 +323,12 @@ def main() -> int:
         help="Only print the last N matching records (default: print all).",
     )
 
-    args = ap.parse_args()
-
-    modes: Set[str] = set(args.modes)
-    valid = {"exec", "thinking", "web", "fetch", "file", "all"}
-    unknown = sorted(modes - valid)
-    if unknown:
-        print(
-            f"[error] Unknown mode(s): {', '.join(unknown)}. "
-            f"Valid: exec, thinking, web, fetch, file, all",
-            file=sys.stderr,
-        )
-        return 2
-
-    # Expand "all"
-    if "all" in modes:
-        modes.update({"exec", "thinking", "web", "fetch", "file"})
-        modes.discard("all")
+    args = ap.parse_args(rest_argv)
 
     global USE_COLOR
     if args.no_color:
         USE_COLOR = False
 
-    # Autodetect input file if none supplied
     paths = list(args.paths)
     if not paths:
         try:
